@@ -281,22 +281,35 @@ async def ask_question(
     language: str = "en",
     token: str = "",
 ) -> str:
-    """Ask a question about any GitHub/GitLab/Bitbucket repository using RAG-powered analysis.
+    """Ask a question about any repository or local directory using RAG-powered analysis.
 
-    This tool analyzes the repository codebase and uses retrieval-augmented generation
-    to provide accurate, context-grounded answers. First call for a repo may take longer
-    as it generates embeddings.
+    This tool analyzes the codebase and uses retrieval-augmented generation
+    to provide accurate, context-grounded answers. First call for a repo may take
+    longer as it generates embeddings.
+
+    Accepts both remote URLs and local filesystem paths:
+      - Remote: https://github.com/owner/repo
+      - Local:  /home/riche/Proj/my-project  (auto-translated to Docker mount)
 
     Args:
-        repo_url: Full repository URL (e.g., https://github.com/owner/repo)
+        repo_url: Repository URL or absolute local path
         question: Question to ask about the repository
         provider: AI provider — google, openai, openrouter, ollama
         model: Model name (default: gemini-2.5-flash)
         language: Response language code (default: en)
         token: Personal access token for private repositories (optional)
     """
+    # Detect if this is a local path and translate it
+    effective_url = repo_url
+    if not repo_url.startswith(("http://", "https://")):
+        try:
+            effective_url = _translate_path(repo_url)
+            logger.info("Local path translated: %s -> %s", repo_url, effective_url)
+        except ValueError as exc:
+            return str(exc)
+
     payload = {
-        "repo_url": repo_url,
+        "repo_url": effective_url,
         "type": _detect_repo_type(repo_url),
         "messages": [{"role": "user", "content": question}],
         "provider": provider,
@@ -306,7 +319,7 @@ async def ask_question(
     if token:
         payload["token"] = token
 
-    logger.info("ask_question: %s — %s", repo_url, question[:80])
+    logger.info("ask_question: %s — %s", effective_url, question[:80])
     return await _stream_response("/chat/completions/stream", payload)
 
 
@@ -484,10 +497,11 @@ async def analyze_local_repo(
     if not question:
         return f"Repository structure at {path}:\n\n{json.dumps(structure, indent=2)}"
 
-    # If question provided, use the chat endpoint with local repo context
+    # If question provided, use the chat endpoint with the container path directly.
+    # DeepWiki's RAG pipeline treats any non-http(s) repo_url as a local path.
     payload = {
-        "repo_url": f"local://{container_path}",
-        "type": "local",
+        "repo_url": container_path,
+        "type": "github",  # Type is used for URL parsing only; local paths bypass it
         "messages": [{"role": "user", "content": question}],
         "provider": "google",
         "model": "gemini-2.5-flash",
