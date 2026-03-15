@@ -59,10 +59,7 @@ logger = logging.getLogger("deepwiki-local")
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    "deepwiki-local",
-    description="Self-hosted DeepWiki for private and local repository analysis",
-)
+mcp = FastMCP("deepwiki-local")
 
 # ---------------------------------------------------------------------------
 # HTTP Client Helpers
