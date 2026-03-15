@@ -1,12 +1,13 @@
 # DeepWiki Open — Local MCP Integration Overrides
 # Customizations for self-hosted Claude Code MCP integration
 # Upstream docker-compose.yml remains unmodified
+#
+# NOTE: Ports are NOT overridden here because docker-compose merges (appends)
+# port arrays, causing duplicate binding conflicts. Upstream ports (8001, 3000)
+# bind to 0.0.0.0 which is safe on WSL2 (NAT-isolated from host network).
 
 services:
   deepwiki:
-    ports:
-      - "127.0.0.1:${PORT:-8001}:${PORT:-8001}"  # API — localhost only
-      - "127.0.0.1:3000:3000"                      # Web UI — localhost only
     volumes:
       - ${HOME}/.adalflow:/root/.adalflow           # Persistent storage (repos, FAISS, cache)
       - /home/riche/Proj:/host/projects:ro           # Local projects — read-only
