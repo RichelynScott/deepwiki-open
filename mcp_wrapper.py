@@ -123,13 +123,14 @@ async def _request_with_retry(
     )
 
 
-async def _stream_sse(
+async def _stream_response(
     path: str,
     payload: dict,
 ) -> str:
     """
-    POST to a streaming SSE endpoint and aggregate the full response.
+    POST to a streaming endpoint and aggregate the full response.
 
+    Handles both plain-text streaming and SSE (data: prefix) formats.
     Collects chunks until the stream ends. Enforces idle timeout and size limit.
     Does NOT retry once streaming has begun.
     """
@@ -139,7 +140,6 @@ async def _stream_sse(
     async with _get_client() as client:
         try:
             async with client.stream("POST", path, json=payload) as response:
-                # Validate response before parsing
                 content_type = response.headers.get("content-type", "")
                 if response.status_code != 200:
                     body = await response.aread()
@@ -147,64 +147,53 @@ async def _stream_sse(
                         f"DeepWiki API returned {response.status_code}: {body.decode()[:500]}"
                     )
 
-                logger.info("SSE stream started for %s", path)
+                is_sse = "text/event-stream" in content_type
+                logger.info(
+                    "Stream started for %s (format: %s)",
+                    path,
+                    "SSE" if is_sse else "plain-text",
+                )
 
-                async for line in response.aiter_lines():
-                    # SSE format: "data: {...}"
-                    if not line.startswith("data: "):
+                async for chunk in response.aiter_text():
+                    if not chunk:
                         continue
 
-                    data_str = line[6:]  # Strip "data: " prefix
+                    if is_sse:
+                        # SSE format: parse "data: ..." lines
+                        for line in chunk.split("\n"):
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                content = _extract_content(data)
+                            except json.JSONDecodeError:
+                                content = data_str
+                            if content:
+                                collected.append(content)
+                                total_bytes += len(content.encode("utf-8"))
+                    else:
+                        # Plain text streaming — append chunks directly
+                        collected.append(chunk)
+                        total_bytes += len(chunk.encode("utf-8"))
 
-                    # Handle end-of-stream marker
-                    if data_str.strip() == "[DONE]":
+                    # Check size limit
+                    if total_bytes > MAX_RESPONSE_SIZE_BYTES:
+                        collected.append(
+                            f"\n\n[TRUNCATED: Response exceeded "
+                            f"{MAX_RESPONSE_SIZE_BYTES // (1024*1024)}MB limit. "
+                            f"Received {total_bytes} bytes before truncation.]"
+                        )
+                        logger.warning("Response truncated at %d bytes", total_bytes)
                         break
-
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        # Non-JSON data line — append as-is
-                        collected.append(data_str)
-                        total_bytes += len(data_str)
-                        continue
-
-                    # Extract content from various possible SSE formats
-                    content = ""
-                    if isinstance(data, dict):
-                        content = data.get("content", "")
-                        if not content:
-                            # OpenAI-style delta format
-                            choices = data.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                        if not content:
-                            # Simple message format
-                            content = data.get("message", "")
-                            if not content:
-                                content = data.get("text", "")
-                    elif isinstance(data, str):
-                        content = data
-
-                    if content:
-                        collected.append(content)
-                        total_bytes += len(content.encode("utf-8"))
-
-                        # Check size limit
-                        if total_bytes > MAX_RESPONSE_SIZE_BYTES:
-                            collected.append(
-                                f"\n\n[TRUNCATED: Response exceeded {MAX_RESPONSE_SIZE_BYTES // (1024*1024)}MB limit. "
-                                f"Received {total_bytes} bytes before truncation.]"
-                            )
-                            logger.warning(
-                                "Response truncated at %d bytes", total_bytes
-                            )
-                            break
 
         except httpx.ReadTimeout:
             if collected:
                 collected.append(
-                    f"\n\n[STREAM INTERRUPTED: No data received for {CHUNK_IDLE_TIMEOUT_S}s. "
+                    f"\n\n[STREAM INTERRUPTED: No data received for "
+                    f"{CHUNK_IDLE_TIMEOUT_S}s. "
                     f"Partial response returned ({total_bytes} bytes).]"
                 )
                 logger.warning("Stream timed out after %d bytes", total_bytes)
@@ -215,8 +204,29 @@ async def _stream_sse(
                 )
 
     result = "".join(collected)
-    logger.info("SSE stream completed: %d bytes", len(result.encode("utf-8")))
+    logger.info("Stream completed: %d bytes", len(result.encode("utf-8")))
     return result
+
+
+def _extract_content(data: dict | str) -> str:
+    """Extract content from various SSE JSON formats."""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, dict):
+        return ""
+    # Direct content field
+    content = data.get("content", "")
+    if content:
+        return content
+    # OpenAI-style delta format
+    choices = data.get("choices", [])
+    if choices:
+        delta = choices[0].get("delta", {})
+        content = delta.get("content", "")
+        if content:
+            return content
+    # Simple message format
+    return data.get("message", "") or data.get("text", "")
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +306,7 @@ async def ask_question(
         payload["token"] = token
 
     logger.info("ask_question: %s — %s", repo_url, question[:80])
-    return await _stream_sse("/chat/completions/stream", payload)
+    return await _stream_response("/chat/completions/stream", payload)
 
 
 @mcp.tool()
@@ -483,7 +493,7 @@ async def analyze_local_repo(
         "language": "en",
     }
 
-    return await _stream_sse("/chat/completions/stream", payload)
+    return await _stream_response("/chat/completions/stream", payload)
 
 
 @mcp.tool()
