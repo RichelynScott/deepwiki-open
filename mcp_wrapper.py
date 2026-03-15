@@ -147,18 +147,19 @@ async def _stream_response(
                         f"DeepWiki API returned {response.status_code}: {body.decode()[:500]}"
                     )
 
-                is_sse = "text/event-stream" in content_type
-                logger.info(
-                    "Stream started for %s (format: %s)",
-                    path,
-                    "SSE" if is_sse else "plain-text",
-                )
+                logger.info("Stream started for %s", path)
 
+                # DeepWiki may report text/event-stream but send plain text
+                # without SSE framing. Always try plain-text collection and
+                # only parse SSE if we actually see "data: " prefixed lines.
                 async for chunk in response.aiter_text():
                     if not chunk:
                         continue
 
-                    if is_sse:
+                    # Check if this chunk contains actual SSE framing
+                    has_sse_prefix = "data: " in chunk
+
+                    if has_sse_prefix:
                         # SSE format: parse "data: ..." lines
                         for line in chunk.split("\n"):
                             if not line.startswith("data: "):
