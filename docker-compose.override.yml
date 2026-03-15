@@ -1,0 +1,17 @@
+# DeepWiki Open — Local MCP Integration Overrides
+# Customizations for self-hosted Claude Code MCP integration
+# Upstream docker-compose.yml remains unmodified
+
+services:
+  deepwiki:
+    ports:
+      - "127.0.0.1:${PORT:-8001}:${PORT:-8001}"  # API — localhost only
+      - "127.0.0.1:3000:3000"                      # Web UI — localhost only
+    volumes:
+      - ${HOME}/.adalflow:/root/.adalflow           # Persistent storage (repos, FAISS, cache)
+      - /home/riche/Proj:/host/projects:ro           # Local projects — read-only
+      - /home/riche/MCPs:/host/mcps:ro               # MCP repos — read-only
+      - ./api/logs:/app/api/logs                     # Persist logs
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges
