@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -230,6 +231,36 @@ def _extract_content(data: dict | str) -> str:
     return data.get("message", "") or data.get("text", "")
 
 
+def _format_metadata(
+    *,
+    source: str,
+    source_type: str,
+    provider: str,
+    model: str,
+    response_bytes: int,
+    duration_s: float,
+    cached: bool | None = None,
+) -> str:
+    """Format a metadata footer for tool responses."""
+    lines = [
+        "",
+        "---",
+        "**DeepWiki Local — Usage Metadata**",
+        f"| Field | Value |",
+        f"|-------|-------|",
+        f"| Source | `{source}` |",
+        f"| Type | {source_type} |",
+        f"| Provider | {provider} |",
+        f"| Model | {model} |",
+        f"| Response size | {response_bytes:,} bytes |",
+        f"| Duration | {duration_s:.1f}s |",
+    ]
+    if cached is not None:
+        lines.append(f"| Embeddings | {'cached' if cached else 'freshly generated (API cost)'} |")
+    lines.append(f"| API calls | Embedding{'s (cached)' if cached else ' generation'} + LLM generation |")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Path Translation
 # ---------------------------------------------------------------------------
@@ -301,7 +332,8 @@ async def ask_question(
     """
     # Detect if this is a local path and translate it
     effective_url = repo_url
-    if not repo_url.startswith(("http://", "https://")):
+    is_local = not repo_url.startswith(("http://", "https://"))
+    if is_local:
         try:
             effective_url = _translate_path(repo_url)
             logger.info("Local path translated: %s -> %s", repo_url, effective_url)
@@ -319,8 +351,26 @@ async def ask_question(
     if token:
         payload["token"] = token
 
-    logger.info("ask_question: %s — %s", effective_url, question[:80])
-    return await _stream_response("/chat/completions/stream", payload)
+    # Check if embeddings are cached
+    repo_name = os.path.basename(effective_url.rstrip("/"))
+    adalflow_db = os.path.expanduser(f"~/.adalflow/databases/{repo_name}.pkl")
+    embeddings_cached = os.path.exists(adalflow_db)
+
+    logger.info("ask_question: %s — %s (cached=%s)", effective_url, question[:80], embeddings_cached)
+    t0 = time.monotonic()
+    result = await _stream_response("/chat/completions/stream", payload)
+    duration = time.monotonic() - t0
+
+    metadata = _format_metadata(
+        source=repo_url,
+        source_type="local directory" if is_local else "remote repository",
+        provider=provider,
+        model=model or "gemini-2.5-flash",
+        response_bytes=len(result.encode("utf-8")),
+        duration_s=duration,
+        cached=embeddings_cached,
+    )
+    return result + metadata
 
 
 @mcp.tool()
@@ -499,16 +549,35 @@ async def analyze_local_repo(
 
     # If question provided, use the chat endpoint with the container path directly.
     # DeepWiki's RAG pipeline treats any non-http(s) repo_url as a local path.
+    provider = "google"
+    model = "gemini-2.5-flash"
     payload = {
         "repo_url": container_path,
         "type": "github",  # Type is used for URL parsing only; local paths bypass it
         "messages": [{"role": "user", "content": question}],
-        "provider": "google",
-        "model": "gemini-2.5-flash",
+        "provider": provider,
+        "model": model,
         "language": "en",
     }
 
-    return await _stream_response("/chat/completions/stream", payload)
+    repo_name = os.path.basename(container_path.rstrip("/"))
+    adalflow_db = os.path.expanduser(f"~/.adalflow/databases/{repo_name}.pkl")
+    embeddings_cached = os.path.exists(adalflow_db)
+
+    t0 = time.monotonic()
+    result = await _stream_response("/chat/completions/stream", payload)
+    duration = time.monotonic() - t0
+
+    metadata = _format_metadata(
+        source=path,
+        source_type="local directory",
+        provider=provider,
+        model=model,
+        response_bytes=len(result.encode("utf-8")),
+        duration_s=duration,
+        cached=embeddings_cached,
+    )
+    return result + metadata
 
 
 @mcp.tool()
