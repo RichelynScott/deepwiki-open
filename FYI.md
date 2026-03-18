@@ -25,3 +25,32 @@
 - Content-Type validation before SSE parsing
 - Docker `no-new-privileges` security option
 - Typed ToolError on response overflow (not silent truncation)
+
+## 2026-03-18 — Local Directory Support + Metadata + Streaming Fixes
+### What: Major feature additions and bug fixes across 4 commits
+### Why: Original wrapper only worked with GitHub URLs; user needed local directory analysis
+### How: Fixed stream parsing (DeepWiki sends plain text despite SSE Content-Type), fixed local path handling (raw path, not local:// prefix), added metadata footer to tool responses
+### Impact: `ask_question` now accepts both URLs and local paths (`/home/riche/Proj/*`)
+
+### Bug Fixes
+1. **FastMCP 3.x API change**: Removed deprecated `description` kwarg from constructor
+2. **SSE parsing**: DeepWiki sends plain text with `Content-Type: text/event-stream` — now auto-detects format per chunk instead of trusting header
+3. **Local path handling**: Changed `local://container_path` to raw `container_path` — DeepWiki treats any non-http path as local
+
+### Embedding Storage Analysis
+- Format: AdalFlow `LocalDB` pickle → `Document` objects with 256-dim vectors
+- Model: OpenAI `text-embedding-3-small` (truncated from 1536 to 256)
+- Storage: `~/.adalflow/databases/{repo_name}.pkl` — one file per repo
+- Cached after first query — subsequent queries only cost LLM call
+- Cost: ~$0.02/1M tokens for embeddings (~$0.10/year at current usage)
+
+### PAL Expert Analysis: Cost Optimization (Gemini 3.1 Pro)
+- **Embeddings**: Keep OpenAI — $0.10/year is effectively free, zero server footprint
+- **Vector store**: FAISS lacks CRUD/metadata filtering — LanceDB recommended as upgrade
+- **LLM**: Gemini 2.5 Flash is cost-optimal at $0.075/1M input tokens
+- **Ollama local**: NOT cheaper when factoring daemon RAM overhead
+
+### Global Docs Updated
+- 3 skills: research-methodologies, tool-guides, deep-research
+- 3 docs: advanced-methodologies.md, MULTI_AGENT_ORCHESTRATION_SPEC.md, CLAUDE_DESKTOP_WSL_INTEGRATION.md
+- MASTER_AGENT_DIRECTORY.md, agent-orchestration skill (prior session)
