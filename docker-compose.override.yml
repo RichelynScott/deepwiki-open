@@ -10,7 +10,7 @@ services:
   deepwiki:
     volumes:
       - ${HOME}/.adalflow:/root/.adalflow           # Persistent storage (repos, FAISS, cache)
-      - /home/riche/Proj:/host/projects:ro           # Local projects — read-only
+      - /home/riche/Proj:/host/projects               # Local projects — rw needed for DeepWiki makedirs check
       - /home/riche/MCPs:/host/mcps:ro               # MCP repos — read-only
       - ./api/logs:/app/api/logs                     # Persist logs
     restart: unless-stopped
