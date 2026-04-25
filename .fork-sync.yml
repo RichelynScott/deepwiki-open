@@ -1,0 +1,20 @@
+upstream: https://github.com/AsyncFuncAI/deepwiki-open.git
+upstream_branch: main
+fork_branch: main
+
+fork_owned_paths:
+  - CLAUDE.md
+  - FYI.md
+  - docs/PRD.md
+  - mcp_wrapper.py
+  - requirements-mcp.txt
+  - docker-compose.override.yml
+  - .env.sample
+
+take_theirs_paths:
+  - package.json
+  - package-lock.json
+
+post_merge:
+  - npm install
+  - npm run build
