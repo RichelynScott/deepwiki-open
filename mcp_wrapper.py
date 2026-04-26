@@ -71,6 +71,78 @@ TYPICAL_RAG_CONTEXT_TOKENS = 5000
 
 USAGE_LOG_PATH = Path.home() / ".deepwiki-local-usage.jsonl"
 
+# Cache freshness check
+ADALFLOW_DB_DIR = Path.home() / ".adalflow" / "databases"
+STALENESS_FILE_CAP = 200  # stop walking after this many checks (perf bound)
+STALENESS_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "__pycache__", ".next", "dist", "build",
+    ".adalflow", "archive", ".claude",
+}
+
+# Ephemeral files / dirs to exclude from RAG embedding to prevent
+# citation contamination — agent-authored peer correspondence, session state,
+# task coordination scratch. Per upstream `api/simple_chat.py:71-74`,
+# /chat/completions/stream accepts excluded_dirs/excluded_files as newline-delimited.
+# Matching is exact path-component (no globs in upstream), so we statically list
+# common names AND dynamically discover *_INBOX folders at request time.
+EPHEMERAL_STATIC_EXCLUDED_DIRS = [
+    "archive",
+    "_archive",
+    "hermes-briefs",
+    "claude-briefs",
+    "logs",
+    ".cpm-logs",
+    ".claude",
+    ".hermes",
+    ".codex",
+]
+EPHEMERAL_STATIC_EXCLUDED_FILES = [
+    "HANDOFF.md",
+    "FYI.md",
+    "DECISIONS_LOG.md",
+    "RATE_LIMIT_TRIGGERED.md",
+    ".claude-session-name",
+    ".claude-current-model",
+]
+
+
+def _resolve_ephemeral_excludes(host_path: str | None) -> tuple[list[str], list[str]]:
+    """
+    Resolve the full set of ephemeral exclusions for a repo.
+
+    Combines static names with dynamically-discovered *_INBOX folders
+    (top-level + one deep). Returns (excluded_dirs, excluded_files).
+
+    For remote URLs, returns static exclusions only.
+    """
+    excluded_dirs = list(EPHEMERAL_STATIC_EXCLUDED_DIRS)
+    excluded_files = list(EPHEMERAL_STATIC_EXCLUDED_FILES)
+
+    if not host_path:
+        return excluded_dirs, excluded_files
+    repo = Path(host_path)
+    if not repo.exists() or not repo.is_dir():
+        return excluded_dirs, excluded_files
+
+    # Discover *_INBOX folders (variable names per session)
+    try:
+        for entry in repo.iterdir():
+            if entry.is_dir() and entry.name.endswith("_INBOX"):
+                excluded_dirs.append(entry.name)
+        # one level deep
+        for sub in repo.iterdir():
+            if sub.is_dir() and sub.name not in STALENESS_SKIP_DIRS and not sub.name.startswith("."):
+                try:
+                    for entry in sub.iterdir():
+                        if entry.is_dir() and entry.name.endswith("_INBOX"):
+                            excluded_dirs.append(entry.name)
+                except OSError:
+                    continue
+    except OSError as exc:
+        logger.warning("Failed to enumerate %s for INBOX discovery: %s", repo, exc)
+
+    return excluded_dirs, excluded_files
+
 _TOKENIZER: tiktoken.Encoding | None = None
 
 
@@ -131,6 +203,72 @@ def _estimate_cost(
         "cost_total_usd": cost_in + cost_out,
         "price_known": model in PRICE_TABLE_USD_PER_M,
     }
+
+
+def _check_cache_staleness(repo_host_path: str | None, db_path: Path) -> dict | None:
+    """
+    Check whether the cached embedding DB is stale relative to source files.
+
+    Returns None if check is not applicable (remote URL, missing repo, missing DB).
+    Returns dict with keys: stale (bool), files_newer (int), sample (list of relative paths).
+
+    Walks up to STALENESS_FILE_CAP files; stops early once we know the cache is stale.
+    """
+    if not repo_host_path or not db_path.exists():
+        return None
+    repo = Path(repo_host_path)
+    if not repo.exists() or not repo.is_dir():
+        return None
+
+    db_mtime = db_path.stat().st_mtime
+    files_checked = 0
+    files_newer: list[str] = []
+
+    for root, dirs, files in os.walk(repo, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in STALENESS_SKIP_DIRS and not d.startswith(".")]
+        for fname in files:
+            if fname.startswith("."):
+                continue
+            fpath = Path(root) / fname
+            files_checked += 1
+            try:
+                if fpath.stat().st_mtime > db_mtime:
+                    files_newer.append(str(fpath.relative_to(repo)))
+                    if len(files_newer) >= 5:
+                        return {
+                            "stale": True,
+                            "files_newer": len(files_newer),
+                            "sample": files_newer[:5],
+                            "checked": files_checked,
+                            "db_age_hours": (time.time() - db_mtime) / 3600,
+                        }
+            except OSError:
+                continue
+            if files_checked >= STALENESS_FILE_CAP:
+                break
+        if files_checked >= STALENESS_FILE_CAP:
+            break
+
+    return {
+        "stale": bool(files_newer),
+        "files_newer": len(files_newer),
+        "sample": files_newer[:5],
+        "checked": files_checked,
+        "db_age_hours": (time.time() - db_mtime) / 3600,
+    }
+
+
+def _invalidate_cache(repo_name: str) -> bool:
+    """Delete the cached embedding DB for force-refresh. Returns True if a file was removed."""
+    db_path = ADALFLOW_DB_DIR / f"{repo_name}.pkl"
+    if db_path.exists():
+        try:
+            db_path.unlink()
+            logger.info("Cache invalidated: %s", db_path)
+            return True
+        except OSError as exc:
+            logger.warning("Failed to invalidate cache %s: %s", db_path, exc)
+    return False
 
 
 def _log_usage(
@@ -357,6 +495,7 @@ def _format_metadata(
     duration_s: float,
     cached: bool | None = None,
     estimate: dict | None = None,
+    staleness: dict | None = None,
 ) -> str:
     """Format a metadata footer for tool responses."""
     lines = [
@@ -387,6 +526,21 @@ def _format_metadata(
                 f"| **Cost total (est.)** | **${estimate['cost_total_usd']:.6f}** |",
             ]
         )
+
+    if staleness is not None:
+        if staleness["stale"]:
+            sample = ", ".join(staleness["sample"][:3])
+            extra = "+more" if staleness["files_newer"] > 3 else ""
+            lines.append(
+                f"| ⚠️ Cache staleness | DB is {staleness['db_age_hours']:.1f}h old; "
+                f"≥{staleness['files_newer']} source file(s) newer "
+                f"({sample}{extra}). Pass `force_refresh=True` to regenerate. |"
+            )
+        else:
+            lines.append(
+                f"| Cache freshness | OK — DB {staleness['db_age_hours']:.1f}h old, "
+                f"no newer source files in {staleness['checked']} checked. |"
+            )
         if not estimate["price_known"]:
             lines.append(
                 f"| ⚠️ Price | model `{model}` not in price table — used default "
@@ -453,6 +607,7 @@ async def ask_question(
     model: str = "gemini-2.5-flash",
     language: str = "en",
     token: str = "",
+    force_refresh: bool = False,
 ) -> str:
     """Ask a question about any repository or local directory using RAG-powered analysis.
 
@@ -471,6 +626,8 @@ async def ask_question(
         model: Model name (default: gemini-2.5-flash)
         language: Response language code (default: en)
         token: Personal access token for private repositories (optional)
+        force_refresh: If True, delete cached embeddings before answering (one-time
+            embedding cost will be incurred). Use after source code has changed.
     """
     # Detect if this is a local path and translate it
     effective_url = repo_url
@@ -482,6 +639,10 @@ async def ask_question(
         except ValueError as exc:
             return str(exc)
 
+    # Ephemeral exclusions (citation-contamination guard) — passed to upstream
+    # via the runtime excluded_dirs/excluded_files knobs (api/simple_chat.py:71-74).
+    excluded_dirs, excluded_files = _resolve_ephemeral_excludes(repo_url if is_local else None)
+
     payload = {
         "repo_url": effective_url,
         "type": _detect_repo_type(repo_url),
@@ -489,14 +650,24 @@ async def ask_question(
         "provider": provider,
         "model": model,
         "language": language,
+        "excluded_dirs": "\n".join(excluded_dirs),
+        "excluded_files": "\n".join(excluded_files),
     }
     if token:
         payload["token"] = token
 
-    # Check if embeddings are cached
+    # Check if embeddings are cached + handle force_refresh
     repo_name = os.path.basename(effective_url.rstrip("/"))
-    adalflow_db = os.path.expanduser(f"~/.adalflow/databases/{repo_name}.pkl")
-    embeddings_cached = os.path.exists(adalflow_db)
+    db_path = ADALFLOW_DB_DIR / f"{repo_name}.pkl"
+
+    if force_refresh:
+        invalidated = _invalidate_cache(repo_name)
+        logger.info("force_refresh=True (existed=%s) for %s", invalidated, repo_name)
+
+    embeddings_cached = db_path.exists()
+
+    # Staleness check (only for local paths — we can't see remote source mtimes)
+    staleness = _check_cache_staleness(repo_url if is_local else None, db_path) if embeddings_cached else None
 
     logger.info("ask_question: %s — %s (cached=%s)", effective_url, question[:80], embeddings_cached)
     t0 = time.monotonic()
@@ -529,6 +700,7 @@ async def ask_question(
         duration_s=duration,
         cached=embeddings_cached,
         estimate=estimate,
+        staleness=staleness,
     )
     return result + metadata
 
@@ -709,15 +881,20 @@ async def list_projects() -> str:
 async def analyze_local_repo(
     path: str,
     question: str = "",
+    force_refresh: bool = False,
 ) -> str:
     """Analyze a repository from the local filesystem.
 
     The path is automatically translated from the host filesystem to the
     Docker container mount. Supported paths: /home/riche/Proj/* and /home/riche/MCPs/*
 
+    Ephemeral peer-correspondence files (*_INBOX/, HANDOFF.md, FYI.md, archive/, etc.)
+    are excluded from RAG embedding to prevent citation contamination.
+
     Args:
         path: Absolute path to the repository on the host filesystem
         question: Optional question to ask about the repo (if empty, returns structure only)
+        force_refresh: If True, delete cached embeddings before answering
     """
     # Translate and validate path
     try:
@@ -742,6 +919,10 @@ async def analyze_local_repo(
     # DeepWiki's RAG pipeline treats any non-http(s) repo_url as a local path.
     provider = "google"
     model = "gemini-2.5-flash"
+
+    # Ephemeral exclusions resolved against the HOST path (we have it here)
+    excluded_dirs, excluded_files = _resolve_ephemeral_excludes(path)
+
     payload = {
         "repo_url": container_path,
         "type": "github",  # Type is used for URL parsing only; local paths bypass it
@@ -749,11 +930,18 @@ async def analyze_local_repo(
         "provider": provider,
         "model": model,
         "language": "en",
+        "excluded_dirs": "\n".join(excluded_dirs),
+        "excluded_files": "\n".join(excluded_files),
     }
 
     repo_name = os.path.basename(container_path.rstrip("/"))
-    adalflow_db = os.path.expanduser(f"~/.adalflow/databases/{repo_name}.pkl")
-    embeddings_cached = os.path.exists(adalflow_db)
+    db_path = ADALFLOW_DB_DIR / f"{repo_name}.pkl"
+
+    if force_refresh:
+        _invalidate_cache(repo_name)
+
+    embeddings_cached = db_path.exists()
+    staleness = _check_cache_staleness(path, db_path) if embeddings_cached else None
 
     t0 = time.monotonic()
     result = await _stream_response("/chat/completions/stream", payload)
@@ -784,6 +972,7 @@ async def analyze_local_repo(
         duration_s=duration,
         cached=embeddings_cached,
         estimate=estimate,
+        staleness=staleness,
     )
     return result + metadata
 

@@ -38,12 +38,31 @@ Claude Code (stdio) ─► mcp_wrapper.py ─► httpx ─► http://localhost:8
 
 | Tool | Purpose | Cost |
 |---|---|---|
-| `ask_question(repo_url, question, provider, model, language, token)` | RAG Q&A over a remote URL or absolute local path. Auto-detects local vs remote and translates path via allowlist. | LLM call + (first-time only) embedding generation. Estimate appended to response. |
-| `analyze_local_repo(path, question)` | Same as `ask_question` for a host filesystem path. With `question=""`, returns repo structure only (free). | Same as `ask_question` when `question` set. Free for structure-only. |
+| `ask_question(repo_url, question, provider, model, language, token, force_refresh)` | RAG Q&A over a remote URL or absolute local path. Auto-detects local vs remote and translates path via allowlist. `force_refresh=True` invalidates cached embeddings. | LLM call + (first-time only) embedding generation. Estimate appended to response. |
+| `analyze_local_repo(path, question, force_refresh)` | Same as `ask_question` for a host filesystem path. With `question=""`, returns repo structure only (free). | Same as `ask_question` when `question` set. Free for structure-only. |
 | `read_wiki_structure(owner, repo, repo_type, language)` | TOC of a previously generated wiki. | Free (cache read). |
 | `read_wiki_contents(owner, repo, repo_type, language, section)` | Full generated wiki text, optionally filtered to a section. | Free (cache read). |
 | `list_projects()` | Lists generated wikis AND RAG embedding caches separately. A repo with embeddings but no wiki is still queryable. | Free. |
 | `health_check()` | Container reachability, provider list, default provider, auth mode, API URL. | Free. |
+
+## Citation-Contamination Guard (added 2026-04-25)
+
+**Bug discovered**: DeepWiki's upstream file walker (`api/data_pipeline.py:153-380`, `glob.glob` recursive) embeds the **entire** repo tree by default — including ephemeral peer correspondence (`*_INBOX/`, `HANDOFF.md`, `FYI.md`), task-coordination scratch (`tasks/hermes-briefs/`), and `archive/`. The RAG layer then retrieves these as authoritative evidence, leading to circular citation contamination (an agent's own freshly-written prose cited back as repo ground truth). Reported by HERMES_CC_MGR_AKA_TEST_KING_MGR with concrete reproduction.
+
+**Fix**: The wrapper now injects `excluded_dirs` and `excluded_files` into every `/chat/completions/stream` request via the upstream API's existing runtime knobs (`api/simple_chat.py:71-74`). Two layers of exclusion:
+
+1. **Static list** (`EPHEMERAL_STATIC_EXCLUDED_DIRS` / `_FILES`): `archive`, `_archive`, `hermes-briefs`, `claude-briefs`, `logs`, `.cpm-logs`, `.claude`, `.hermes`, `.codex`; files: `HANDOFF.md`, `FYI.md`, `DECISIONS_LOG.md`, `RATE_LIMIT_TRIGGERED.md`, `.claude-session-name`, `.claude-current-model`.
+2. **Dynamic discovery**: walks repo top-level + 1 deep, finds any folder ending in `_INBOX` (per-session inbox folders have variable names) and adds them to the excluded set.
+
+**Important**: Existing cached `.pkl` files were generated WITHOUT this filter. To purge contamination from prior caches, call `ask_question(..., force_refresh=True)` once per repo.
+
+**Limitation**: Upstream's matching is exact path-component (no glob support). The wrapper's static list covers common names; rare variants need adding to `EPHEMERAL_STATIC_EXCLUDED_*`.
+
+## Cache Freshness
+
+The wrapper warns when the `.pkl` is stale (any source file newer than DB mtime). The footer shows DB age and a 5-file sample of newer files. Pass `force_refresh=True` to regenerate (re-incurs embedding cost).
+
+Walks up to 200 files, skipping `.git`, `node_modules`, `.venv`, `__pycache__`, `.next`, `dist`, `build`, `archive`, `.adalflow`, `.claude`, and dotfiles. Bound by `STALENESS_FILE_CAP`.
 
 ## Cost & Token Telemetry
 
