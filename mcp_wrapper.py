@@ -20,9 +20,11 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import tiktoken
 from fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
@@ -44,6 +46,120 @@ PATH_MAPPINGS: dict[str, str] = {
     "/home/riche/Proj": "/host/projects",
     "/home/riche/MCPs": "/host/mcps",
 }
+
+# Cost estimation
+# Prices in USD per 1M tokens (input, output). Approximate; update as providers change.
+# Source: provider pricing pages, late 2025 / early 2026.
+# Gemini billed by tokens for >=2.5; tiktoken cl100k_base used as universal estimator (±20%).
+PRICE_TABLE_USD_PER_M: dict[str, tuple[float, float]] = {
+    # Google
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-2.5-pro": (1.25, 10.00),
+    # OpenAI
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    # OpenRouter / others — fall through to default
+}
+DEFAULT_PRICE_USD_PER_M: tuple[float, float] = (1.00, 4.00)  # conservative fallback
+
+# Typical retrieved-context size for DeepWiki RAG (top-k=20, ~250 tokens/chunk).
+# Used as floor estimate when we can't observe actual retrieval.
+TYPICAL_RAG_CONTEXT_TOKENS = 5000
+
+USAGE_LOG_PATH = Path.home() / ".deepwiki-local-usage.jsonl"
+
+_TOKENIZER: tiktoken.Encoding | None = None
+
+
+def _get_tokenizer() -> tiktoken.Encoding:
+    """Lazy-load cl100k_base tokenizer (universal approximation)."""
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        _TOKENIZER = tiktoken.get_encoding("cl100k_base")
+    return _TOKENIZER
+
+
+def _count_tokens(text: str) -> int:
+    """Count tokens via cl100k_base. Approximate for non-OpenAI models (±20%)."""
+    if not text:
+        return 0
+    try:
+        return len(_get_tokenizer().encode(text))
+    except Exception:
+        # Fallback: ~4 chars/token heuristic
+        return max(1, len(text) // 4)
+
+
+def _estimate_cost(
+    *,
+    question: str,
+    response: str,
+    provider: str,
+    model: str,
+    embeddings_cached: bool,
+) -> dict:
+    """
+    Estimate token usage and cost for a DeepWiki RAG call.
+
+    Returns dict with: tokens_in_question, tokens_in_rag_estimate,
+    tokens_out, cost_in_usd, cost_out_usd, cost_total_usd, price_per_m.
+
+    Note: tokens_in is a FLOOR (question + estimated RAG context).
+    Actual retrieved context varies by repo size and query.
+    """
+    tokens_in_question = _count_tokens(question)
+    tokens_in_rag = TYPICAL_RAG_CONTEXT_TOKENS  # estimate
+    tokens_in_total = tokens_in_question + tokens_in_rag
+    tokens_out = _count_tokens(response)
+
+    price_in, price_out = PRICE_TABLE_USD_PER_M.get(model, DEFAULT_PRICE_USD_PER_M)
+    cost_in = (tokens_in_total / 1_000_000) * price_in
+    cost_out = (tokens_out / 1_000_000) * price_out
+
+    return {
+        "tokens_in_question": tokens_in_question,
+        "tokens_in_rag_estimate": tokens_in_rag,
+        "tokens_in_total_estimate": tokens_in_total,
+        "tokens_out": tokens_out,
+        "price_in_per_m": price_in,
+        "price_out_per_m": price_out,
+        "cost_in_usd": cost_in,
+        "cost_out_usd": cost_out,
+        "cost_total_usd": cost_in + cost_out,
+        "price_known": model in PRICE_TABLE_USD_PER_M,
+    }
+
+
+def _log_usage(
+    *,
+    source: str,
+    provider: str,
+    model: str,
+    estimate: dict,
+    duration_s: float,
+    embeddings_cached: bool,
+) -> None:
+    """Append a usage record to ~/.deepwiki-local-usage.jsonl. Never fails the call."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "provider": provider,
+        "model": model,
+        "tokens_in_estimate": estimate["tokens_in_total_estimate"],
+        "tokens_out": estimate["tokens_out"],
+        "cost_total_usd": round(estimate["cost_total_usd"], 6),
+        "duration_s": round(duration_s, 2),
+        "embeddings_cached": embeddings_cached,
+        "price_known": estimate["price_known"],
+    }
+    try:
+        with USAGE_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to write usage log: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -240,14 +356,15 @@ def _format_metadata(
     response_bytes: int,
     duration_s: float,
     cached: bool | None = None,
+    estimate: dict | None = None,
 ) -> str:
     """Format a metadata footer for tool responses."""
     lines = [
         "",
         "---",
         "**DeepWiki Local — Usage Metadata**",
-        f"| Field | Value |",
-        f"|-------|-------|",
+        "| Field | Value |",
+        "|-------|-------|",
         f"| Source | `{source}` |",
         f"| Type | {source_type} |",
         f"| Provider | {provider} |",
@@ -256,8 +373,33 @@ def _format_metadata(
         f"| Duration | {duration_s:.1f}s |",
     ]
     if cached is not None:
-        lines.append(f"| Embeddings | {'cached' if cached else 'freshly generated (API cost)'} |")
+        lines.append(f"| Embeddings | {'cached' if cached else 'freshly generated (one-time API cost)'} |")
     lines.append(f"| API calls | Embedding{'s (cached)' if cached else ' generation'} + LLM generation |")
+
+    if estimate is not None:
+        lines.extend(
+            [
+                f"| Tokens out (counted) | {estimate['tokens_out']:,} |",
+                f"| Tokens in (question) | {estimate['tokens_in_question']:,} |",
+                f"| Tokens in (RAG context, est.) | ~{estimate['tokens_in_rag_estimate']:,} |",
+                f"| Cost (output) | ${estimate['cost_out_usd']:.6f} |",
+                f"| Cost (input, est.) | ${estimate['cost_in_usd']:.6f} |",
+                f"| **Cost total (est.)** | **${estimate['cost_total_usd']:.6f}** |",
+            ]
+        )
+        if not estimate["price_known"]:
+            lines.append(
+                f"| ⚠️ Price | model `{model}` not in price table — used default "
+                f"${estimate['price_in_per_m']:.2f}/M in, ${estimate['price_out_per_m']:.2f}/M out |"
+            )
+        if not cached:
+            lines.append(
+                "| ⚠️ First call | Embedding generation cost (~$0.01–$0.10 depending on repo size) NOT included above |"
+            )
+        lines.append(
+            "| Estimate accuracy | Output: counted exact (cl100k_base, ±5% for non-OpenAI). Input: question exact + 5K-token RAG floor — actual retrieval may be larger. |"
+        )
+
     return "\n".join(lines)
 
 
@@ -361,14 +503,32 @@ async def ask_question(
     result = await _stream_response("/chat/completions/stream", payload)
     duration = time.monotonic() - t0
 
+    effective_model = model or "gemini-2.5-flash"
+    estimate = _estimate_cost(
+        question=question,
+        response=result,
+        provider=provider,
+        model=effective_model,
+        embeddings_cached=embeddings_cached,
+    )
+    _log_usage(
+        source=repo_url,
+        provider=provider,
+        model=effective_model,
+        estimate=estimate,
+        duration_s=duration,
+        embeddings_cached=embeddings_cached,
+    )
+
     metadata = _format_metadata(
         source=repo_url,
         source_type="local directory" if is_local else "remote repository",
         provider=provider,
-        model=model or "gemini-2.5-flash",
+        model=effective_model,
         response_bytes=len(result.encode("utf-8")),
         duration_s=duration,
         cached=embeddings_cached,
+        estimate=estimate,
     )
     return result + metadata
 
@@ -489,29 +649,60 @@ async def read_wiki_contents(
 
 @mcp.tool()
 async def list_projects() -> str:
-    """List all repositories that have been analyzed and cached locally.
+    """List all repositories cached locally — generated wikis AND RAG embeddings.
 
-    Returns a list of repositories that DeepWiki has previously processed,
-    with their wiki generation status.
+    Reports two distinct caches:
+      - Generated wikis (from /api/processed_projects, ~/.adalflow/wikicache/*)
+      - RAG embeddings (~/.adalflow/databases/*.pkl) — created on first ask_question
+
+    A repo with embeddings but no wiki is still queryable via ask_question (cached, fast).
     """
     logger.info("list_projects")
-    response = await _request_with_retry("GET", "/api/processed_projects")
-    data = response.json()
+    lines: list[str] = []
 
-    if not data:
-        return "No projects have been analyzed yet. Use ask_question to analyze a repository."
+    # 1. Generated wikis
+    try:
+        response = await _request_with_retry("GET", "/api/processed_projects")
+        data = response.json()
+        wikis = data if isinstance(data, list) else []
+    except Exception as exc:
+        wikis = []
+        lines.append(f"⚠️ Wiki cache query failed: {exc}\n")
 
-    if isinstance(data, list):
-        lines = [f"Cached projects ({len(data)}):\n"]
-        for project in data:
+    lines.append(f"## Generated wikis ({len(wikis)})")
+    if wikis:
+        for project in wikis:
             if isinstance(project, dict):
                 name = project.get("name", project.get("repo", "unknown"))
                 lines.append(f"  - {name}")
             else:
                 lines.append(f"  - {project}")
-        return "\n".join(lines)
+    else:
+        lines.append("  (none — use the web UI or read_wiki_contents to trigger generation)")
 
-    return json.dumps(data, indent=2)
+    # 2. RAG embedding caches — direct filesystem scan
+    db_dir = Path.home() / ".adalflow" / "databases"
+    rag_dbs: list[tuple[str, int]] = []
+    if db_dir.exists():
+        for pkl in sorted(db_dir.glob("*.pkl")):
+            try:
+                size = pkl.stat().st_size
+                rag_dbs.append((pkl.stem, size))
+            except OSError:
+                continue
+
+    lines.append(f"\n## RAG embedding caches ({len(rag_dbs)})")
+    if rag_dbs:
+        for name, size in rag_dbs:
+            mb = size / (1024 * 1024)
+            lines.append(f"  - {name} ({mb:.1f} MB)")
+        lines.append(
+            "\nThese repos are ready for ask_question (no embedding regeneration cost)."
+        )
+    else:
+        lines.append("  (none — first ask_question on a new repo will generate embeddings)")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -568,6 +759,22 @@ async def analyze_local_repo(
     result = await _stream_response("/chat/completions/stream", payload)
     duration = time.monotonic() - t0
 
+    estimate = _estimate_cost(
+        question=question,
+        response=result,
+        provider=provider,
+        model=model,
+        embeddings_cached=embeddings_cached,
+    )
+    _log_usage(
+        source=path,
+        provider=provider,
+        model=model,
+        estimate=estimate,
+        duration_s=duration,
+        embeddings_cached=embeddings_cached,
+    )
+
     metadata = _format_metadata(
         source=path,
         source_type="local directory",
@@ -576,6 +783,7 @@ async def analyze_local_repo(
         response_bytes=len(result.encode("utf-8")),
         duration_s=duration,
         cached=embeddings_cached,
+        estimate=estimate,
     )
     return result + metadata
 
@@ -602,13 +810,19 @@ async def health_check() -> str:
             f"To start: cd /home/riche/MCPs/deepwiki-open && docker compose up -d"
         )
 
-    # Check available models
+    # Check available models — /models/config returns {"providers": [...], "defaultProvider": "..."}
     try:
         response = await _request_with_retry("GET", "/models/config")
-        models = response.json()
-        if isinstance(models, dict):
-            providers = list(models.keys())
-            results.append(f"Available providers: {', '.join(providers)}")
+        cfg = response.json()
+        if isinstance(cfg, dict):
+            providers = cfg.get("providers", [])
+            if isinstance(providers, list) and providers:
+                provider_ids = [p.get("id", "?") for p in providers if isinstance(p, dict)]
+                default = cfg.get("defaultProvider", "?")
+                results.append(f"Available providers ({len(provider_ids)}): {', '.join(provider_ids)}")
+                results.append(f"Default provider: {default}")
+            else:
+                results.append("Models config: no providers reported")
     except Exception:
         results.append("Models config: unavailable")
 
