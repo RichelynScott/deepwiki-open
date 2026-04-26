@@ -54,3 +54,39 @@
 - 3 skills: research-methodologies, tool-guides, deep-research
 - 3 docs: advanced-methodologies.md, MULTI_AGENT_ORCHESTRATION_SPEC.md, CLAUDE_DESKTOP_WSL_INTEGRATION.md
 - MASTER_AGENT_DIRECTORY.md, agent-orchestration skill (prior session)
+
+## 2026-04-25 — Cost Telemetry + Tool Bug Fixes + CLAUDE.md Rewrite (commit d43e678)
+### What
+Three independent improvements landed in one commit:
+1. **D1 — Tool bug fixes**:
+   - `health_check`: was reporting JSON wrapper keys (`providers, defaultProvider`) instead of actual provider IDs. Now iterates `data["providers"]` array and reports 7 providers + default.
+   - `list_projects`: was returning "No projects analyzed" while 4 RAG caches existed in `~/.adalflow/databases/`. Now reports two sections: generated wikis (from `/api/processed_projects`) and RAG embedding caches (filesystem scan with sizes).
+2. **D2-A — Cost estimator**:
+   - `tiktoken==0.12.0` added to `requirements-mcp.txt`.
+   - `cl100k_base` tokenizer for output (counted exactly) and question (exact). Input includes a 5K-token RAG-context floor.
+   - `PRICE_TABLE_USD_PER_M` covers `gemini-2.5-{flash,flash-lite,pro}` and `gpt-{4o,4o-mini,5,5-mini}`. Unknown models fall to `$1.00/$4.00 per M` with a ⚠️ warning.
+   - First-call embedding cost flagged in footer when `embeddings_cached=False` (range $0.01–$0.10, not included in per-call estimate).
+3. **D3 — Per-call usage log**:
+   - Every `ask_question` and `analyze_local_repo` appends a JSON line to `~/.deepwiki-local-usage.jsonl` with timestamp, source, provider, model, token estimates, cost, duration, cache state.
+   - Grep-friendly weekly tally via jq.
+
+### Why
+User asked: "Why is there no token or cost measurements/estimates before costing? How can we improve this?" Root cause: DeepWiki upstream (`api/simple_chat.py`) streams plain model text and never emits a final SSE `usage` event, so the wrapper had no upstream signal to capture. Fix: do it locally with tiktoken + a price table.
+
+### How
+Wrapper-only changes; no upstream files touched. Estimator runs after `_stream_response` returns; metadata footer extended; jsonl log appended best-effort (never fails the call).
+
+### Impact
+- Every paid call now shows estimated cost in metadata footer.
+- Lifetime/weekly spend tracking via `jq -s 'map(.cost_total_usd) | add' ~/.deepwiki-local-usage.jsonl`.
+- Two latent UX bugs fixed (health_check, list_projects).
+- CLAUDE.md fully rewritten — adds customization-seam hard rule, mounts table with `:rw` reasons, security incl. WSL2 NAT note, known issues, history, ops including reconnect rule.
+
+### Known limits (intentional)
+- No pre-call dry-run preview (would require mirroring DeepWiki retriever).
+- Input estimate is a floor (real RAG retrieval depth unobservable).
+- Estimates may drift ±20% from provider billing — verify dashboards for spend that matters.
+
+### Related
+- Commit `d43e678`
+- Global: `~/.claude/MASTER_DIRECTORIES/MASTER_MCP_DIRECTORY.md` line 42 updated to reflect cost telemetry and enabled state
