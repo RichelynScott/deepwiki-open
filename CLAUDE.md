@@ -21,7 +21,11 @@ Claude Code (stdio) ─► mcp_wrapper.py ─► httpx ─► http://localhost:8
 | **Our customizations** | `mcp_wrapper.py`, `docker-compose.override.yml`, `.env`, `requirements-mcp.txt`, `CLAUDE.md`, `FYI.md`, `docs/` | This fork |
 | **State** | `~/.adalflow/databases/*.pkl` (RAG embeddings), `~/.adalflow/wikicache/` (generated wikis), `~/.adalflow/repos/` (cloned source), `api/logs/` (app logs), `~/.deepwiki-local-usage.jsonl` (per-call cost log) | Runtime |
 
-- **Upstream pin**: commit `4c6a1f7` (2026-03-15). Sync via `.fork-sync.yml`.
+- **Upstream effective state**: last merged at `05591ee` (LaTeX math PR #499, merged 2026-04-23 via merge commit `8437210`). Note: earlier docs cited `4c6a1f7` as the pin; that's stale — local `main` is 3 commits past it. Sync via `.fork-sync.yml`.
+- **Upstream cadence**: ~4 commits / 6 weeks (active but slow). Check drift periodically:
+  ```bash
+  git fetch upstream && git log 05591ee..upstream/main --oneline
+  ```
 - **Fork**: RichelynScott/deepwiki-open.
 
 ## Customization Seams (the only places you may edit)
@@ -175,8 +179,10 @@ See `FYI.md` for full decision journal.
 
 ## Upstream Sync
 
-- Pin: `4c6a1f7` (recorded in `.fork-sync.yml`)
-- Customizations live in seams that don't conflict with upstream: `mcp_wrapper.py` is a new file, `docker-compose.override.yml` is a new file, `.env`/`requirements-mcp.txt` are gitignored or non-conflicting.
+- Effective merge point: `05591ee` (LaTeX PR #499). 2 upstream commits unmerged as of 2026-04-25:
+  - `e8b6f1e` — Bitbucket clone auth fix (#509, low value for us)
+  - `5b43df5` — "Deepwiki is coming back" (non-functional)
+- Customizations live in seams that don't conflict with upstream: `mcp_wrapper.py` is a new file, `docker-compose.override.yml` is a new file, `.env`/`requirements-mcp.txt` are gitignored or non-conflicting. `.fork-sync.yml` lists `fork_owned_paths`: `CLAUDE.md`, `FYI.md`, `docs/PRD.md`, `mcp_wrapper.py`, `requirements-mcp.txt`, `docker-compose.override.yml`, `.env.sample`.
 - Run fork-sync per `~/.claude/skills/fork-sync/`. Conflict surface should be minimal; if a sync touches our seams, treat as a red flag.
 
 ## Related
