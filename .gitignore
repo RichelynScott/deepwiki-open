@@ -71,3 +71,9 @@ next-env.d.ts
 
 # ignore adding self-signed certs
 certs/
+
+# Claude Code session-local logs (hook output)
+logs/
+
+# Per-session inbox folders (ephemeral peer correspondence — not source)
+*_INBOX/
